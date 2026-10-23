@@ -1,0 +1,15 @@
+services:
+  relaykit:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      RELAY_API_TOKEN: ${RELAY_API_TOKEN:?Set RELAY_API_TOKEN}
+      RELAY_SIGNING_SECRET: ${RELAY_SIGNING_SECRET:?Set RELAY_SIGNING_SECRET}
+      RELAY_ALLOW_LOCAL_DEMO: "false"
+    volumes:
+      - relay-data:/data
+volumes:
+  relay-data:
