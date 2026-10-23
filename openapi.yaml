@@ -1,0 +1,185 @@
+openapi: 3.1.0
+info:
+  title: RelayKit API
+  version: 0.1.0
+  description: Single-tenant durable webhook delivery MVP. Queue timestamps are Unix milliseconds.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      security: []
+      summary: Check database readiness
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, const: ok}
+        '503': {$ref: '#/components/responses/Error'}
+  /v1/deliveries:
+    post:
+      summary: Enqueue a delivery idempotently
+      description: Request limit is 65536 bytes. JSON whitespace is compacted for duplicate comparison; key order is significant.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-zA-Z0-9_.:-]{1,128}$'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [destination, payload]
+              properties:
+                destination:
+                  type: string
+                  format: uri
+                  maxLength: 2048
+                  description: Public HTTPS on port 443; literal loopback HTTP is allowed only in explicit local demo mode.
+                payload:
+                  description: Any valid JSON value, including null.
+            example:
+              destination: https://your-authorized-receiver.example/hook
+              payload: {event: order.created, order_id: 1001}
+      responses:
+        '202':
+          description: Created
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EnqueueResult'}
+        '200':
+          description: Same key and request already accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EnqueueResult'}
+        '400': {$ref: '#/components/responses/Error'}
+        '401': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '413': {$ref: '#/components/responses/Error'}
+        '415': {$ref: '#/components/responses/Error'}
+        '500': {$ref: '#/components/responses/Error'}
+    get:
+      summary: Read the latest 100 deliveries
+      responses:
+        '200':
+          description: Newest deliveries first; no pagination in this MVP
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deliveries:
+                    type: array
+                    items: {$ref: '#/components/schemas/Delivery'}
+                  limit: {type: integer, const: 100}
+        '401': {$ref: '#/components/responses/Error'}
+        '500': {$ref: '#/components/responses/Error'}
+  /v1/deliveries/{id}:
+    parameters:
+      - {$ref: '#/components/parameters/DeliveryID'}
+    get:
+      summary: Inspect delivery and complete attempt history
+      responses:
+        '200':
+          description: Delivery found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delivery: {$ref: '#/components/schemas/Delivery'}
+                  attempts:
+                    type: array
+                    items: {$ref: '#/components/schemas/Attempt'}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '500': {$ref: '#/components/responses/Error'}
+  /v1/deliveries/{id}/replay:
+    parameters:
+      - {$ref: '#/components/parameters/DeliveryID'}
+    post:
+      summary: Replay a dead letter
+      description: Only dead deliveries can be replayed. Preserves ID/history and increments cycle; resets attempts.
+      responses:
+        '202':
+          description: Requeued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: {type: string}
+                  status: {type: string, const: pending}
+        '401': {$ref: '#/components/responses/Error'}
+        '404': {$ref: '#/components/responses/Error'}
+        '409': {$ref: '#/components/responses/Error'}
+        '500': {$ref: '#/components/responses/Error'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: RELAY_API_TOKEN, a randomly generated secret of at least 24 characters
+  parameters:
+    DeliveryID:
+      name: id
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-f0-9]{32}$'}
+  responses:
+    Error:
+      description: Request rejected or service error; inspect the error string
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: {type: string}
+  schemas:
+    EnqueueResult:
+      type: object
+      required: [delivery, created]
+      properties:
+        delivery: {$ref: '#/components/schemas/Delivery'}
+        created: {type: boolean}
+    Delivery:
+      type: object
+      properties:
+        id: {type: string, pattern: '^[a-f0-9]{32}$'}
+        idempotency_key: {type: string}
+        destination: {type: string, format: uri}
+        payload:
+          type: string
+          description: Compact JSON serialized as a string, not a nested JSON object
+        status: {type: string, enum: [pending, running, delivered, dead]}
+        attempts: {type: integer, minimum: 0}
+        cycle: {type: integer, minimum: 1}
+        next_at: {type: integer, format: int64}
+        created_at: {type: integer, format: int64}
+        last_error: {type: string}
+    Attempt:
+      type: object
+      properties:
+        number: {type: integer, minimum: 1}
+        cycle: {type: integer, minimum: 1}
+        started_at: {type: integer, format: int64}
+        finished_at:
+          type: integer
+          format: int64
+          description: Zero while still in progress
+        status_code:
+          type: integer
+          description: Zero when no HTTP response was received
+        error: {type: string}
