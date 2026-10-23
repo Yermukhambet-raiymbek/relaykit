@@ -1,53 +1,92 @@
-// receiver is a deliberately flaky LOCAL demo endpoint. Do not expose it publicly.
 package main
 
 import (
-	"encoding/json"
-	"io"
-	"log"
+	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"os"
-	"sync"
+	"os/signal"
+	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/Yermukhambet-raiymbek/relaykit/internal/relay"
 )
 
-func main() {
-	secret := os.Getenv("RELAY_SIGNING_SECRET")
-	if len(secret) < 24 {
-		log.Fatal("set RELAY_SIGNING_SECRET to at least 24 characters")
+func env(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	var mu sync.Mutex
-	counts := map[string]int{}
-	processed := map[string]bool{}
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /hook", func(w http.ResponseWriter, r *http.Request) {
-		body, e := io.ReadAll(http.MaxBytesReader(w, r.Body, 65536))
-		if e != nil {
-			http.Error(w, "body too large", 413)
-			return
+	return fallback
+}
+func run() error {
+	token := os.Getenv("RELAY_API_TOKEN")
+	secret := os.Getenv("RELAY_SIGNING_SECRET")
+	if len(token) < 24 || len(secret) < 24 {
+		return errors.New("set RELAY_API_TOKEN and RELAY_SIGNING_SECRET to separate random values of at least 24 characters")
+	}
+	if token == secret {
+		return errors.New("API token and signing secret must differ")
+	}
+	path := env("RELAY_DB", "./data/relaykit.db")
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return err
+	}
+	// New database/WAL files must not be world-readable; payloads may be private.
+	syscall.Umask(0077)
+	store, err := relay.Open(path)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	policy := relay.Policy{AllowLocalDemo: os.Getenv("RELAY_ALLOW_LOCAL_DEMO") == "true"}
+	if policy.AllowLocalDemo {
+		slog.Warn("local demo mode enabled: literal loopback HTTP destinations are permitted")
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	worker := relay.Worker{Store: store, Client: relay.NewHTTPClient(policy, 10*time.Second), Policy: policy, Secret: secret, Now: time.Now, MaxAttempts: 5, BaseDelay: time.Second, MaxDelay: time.Minute, Lease: 30 * time.Second}
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				worked, e := worker.Step(ctx)
+				if e != nil && ctx.Err() == nil {
+					slog.Error("worker error", "error", e)
+				}
+				if worked && e == nil {
+					slog.Info("delivery attempt completed")
+				}
+			}
 		}
-		id := r.Header.Get("X-Relay-ID")
-		if id == "" || !relay.VerifySignature(secret, r.Header.Get("X-Relay-Timestamp"), id, body, r.Header.Get("X-Relay-Signature"), time.Now(), 5*time.Minute) {
-			http.Error(w, "invalid signature", 401)
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		counts[id]++
-		if counts[id] <= 2 {
-			log.Printf("%s simulated transient failure %d", id, counts[id])
-			http.Error(w, "simulated outage", 503)
-			return
-		}
-		duplicate := processed[id]
-		processed[id] = true
-		log.Printf("%s accepted, duplicate=%v", id, duplicate)
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"accepted": true, "duplicate": duplicate})
-	})
-	log.Print("Flaky demo receiver on 127.0.0.1:9090; first two attempts return 503")
-	s := &http.Server{Addr: "127.0.0.1:9090", Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second}
-	log.Fatal(s.ListenAndServe())
+	}()
+	api := relay.API{Store: store, Token: token, Policy: policy, Now: time.Now}
+	server := &http.Server{Addr: env("RELAY_ADDR", "127.0.0.1:8080"), Handler: api.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 << 10}
+	errCh := make(chan error, 1)
+	go func() { slog.Info("RelayKit listening", "addr", server.Addr); errCh <- server.ListenAndServe() }()
+	select {
+	case e := <-errCh:
+		cancel()
+		<-workerDone
+		return e
+	case <-ctx.Done():
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer stopCancel()
+	err = server.Shutdown(stopCtx)
+	<-workerDone
+	return err
+}
+func main() {
+	if err := run(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		slog.Error("stopped", "error", err)
+		os.Exit(1)
+	}
 }
